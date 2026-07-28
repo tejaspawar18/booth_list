@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# Data is deliberately NOT tracked. The booth rolls contain personal voter data
+# (EPIC numbers, names, relatives, house numbers, ages) and the PDFs are ~21 GB,
+# far beyond GitHub's limits. Only the code lives in this repo.
+# ---------------------------------------------------------------------------
+
+# Downloaded/derived voter data (PII + large)
+booth_list_pdf/
+booth_list_csv/
+localities/
+localities_map/
+
+# Third-party OCR model data (large, re-downloadable)
+tessdata_best/
+
+# Secrets — never commit
+.env
+*.env
+*credentials*.json
+*service-account*.json
+gen-lang-client-*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
