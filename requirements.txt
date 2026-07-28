@@ -1,0 +1,11 @@
+# Python dependencies for the ECI voter-roll download + extraction scripts.
+# Pinned to the versions in the working venv. Install with:
+#   python -m pip install -r requirements.txt
+
+requests==2.33.1          # ECI portal / CDN HTTP client
+cryptography==49.0.0      # RSA-OAEP + AES-GCM request envelope, captcha decrypt
+pdfplumber==0.11.10       # read text/layout from booth-roll PDFs
+pytesseract==0.3.13       # Tesseract OCR wrapper (needs the tesseract binary)
+opencv-python==5.0.0.93   # image pre-processing for OCR
+numpy==2.4.4              # array ops for the image pipeline
+Pillow==12.2.0            # image loading / crops
