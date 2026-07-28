@@ -79,17 +79,20 @@ import argparse
 import json
 import logging
 import queue
+import random
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import boto3
 import requests
+from botocore.exceptions import BotoCoreError, ClientError
 
 import download_eci_rolls as base
 from download_eci_rolls import (
-    EciClient, VPD_GATEWAY, cdn_path, download, generate_with_captcha,
+    EciClient, VPD_GATEWAY, cdn_path, generate_with_captcha,
     load_env_files, parse_parts, _match,
 )
 
@@ -100,6 +103,12 @@ FETCH_URL = f"{VPD_GATEWAY}/api/v1/ext-printing-publish/get-published-file"
 FETCH_HEADERS = {"CurrentRole": "citizen", "PLATFORM-TYPE": "web"}
 MIN_PDF_BYTES = 100_000
 FETCH_SESSION: requests.Session | None = None
+
+# Booth PDFs are uploaded straight to S3 and never touch local disk (the data
+# is voter PII and this box's disk isn't the place for it). Only the tiny
+# per-AC manifest and an occasional captcha debug image stay local.
+S3_CLIENT = None
+S3_REGION = "ap-south-1"
 
 
 class Manifest:
@@ -158,8 +167,19 @@ def fetch_session(pool: int) -> requests.Session:
     return s
 
 
-def fetch_file(cli: EciClient, file_id: str, out: Path) -> bool:
-    """Redeem one fileId. Single attempt by contract — see module docstring."""
+def s3_put(bucket: str, key: str, data: bytes) -> bool:
+    try:
+        S3_CLIENT.put_object(Bucket=bucket, Key=key, Body=data,
+                             ContentType="application/pdf")
+    except (BotoCoreError, ClientError) as exc:
+        log.error("S3 upload failed for s3://%s/%s: %s", bucket, key, exc)
+        return False
+    return True
+
+
+def fetch_file(cli: EciClient, file_id: str, bucket: str, key: str) -> bool:
+    """Redeem one fileId and upload the PDF straight to S3. Single attempt by
+    contract — see module docstring."""
     try:
         r = FETCH_SESSION.get(FETCH_URL, params={"fileId": file_id},
                               headers=FETCH_HEADERS, timeout=(10, 45))
@@ -181,11 +201,59 @@ def fetch_file(cli: EciClient, file_id: str, out: Path) -> bool:
     raw = base64.b64decode(payload)
     if raw[:4] != b"%PDF" or len(raw) < MIN_PDF_BYTES:
         return False
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_name(out.name + ".part")
-    tmp.write_bytes(raw)
-    tmp.replace(out)
-    return True
+    return s3_put(bucket, key, raw)
+
+
+def download_to_s3(session: requests.Session, path: str, bucket: str, key: str,
+                   attempts: int = 4) -> bool:
+    """CDN-backed fetch, uploaded straight to S3 — the S3 equivalent of
+    download_eci_rolls.download(), used instead of it so no PDF ever hits
+    local disk."""
+    url = f"{base.CDN_ROOT}/{path}"
+    for attempt in range(attempts):
+        try:
+            r = session.get(url, timeout=180)
+        except requests.RequestException as exc:
+            if attempt < attempts - 1:
+                time.sleep(2 ** attempt + random.uniform(0, 1))
+                continue
+            log.warning("CDN error for %s (%s)", path, exc)
+            return False
+        if r.status_code == 200 and r.content[:4] == b"%PDF":
+            if not s3_put(bucket, key, r.content):
+                return False
+            log.info("uploaded s3://%s/%s (%.1f MB)", bucket, key, len(r.content) / 1e6)
+            return True
+        if r.status_code in base._RETRY_STATUS and attempt < attempts - 1:
+            # 403 is edge throttling; back off harder (and jitter) so parallel
+            # workers don't re-trip the limit in lockstep
+            b = 6 if r.status_code == 403 else 2
+            time.sleep(min(45.0, b * 2 ** attempt) + random.uniform(0, 2))
+            continue
+        note = "throttled (edge 403)" if r.status_code == 403 else f"HTTP {r.status_code}"
+        log.warning("CDN miss for %s (%s)", path, note)
+        return False
+    return False
+
+
+def download_batch_to_s3(session: requests.Session, jobs: dict[int, tuple[str, str]],
+                         bucket: str, workers: int) -> set[int]:
+    """Download {part: (cdn_path, s3_key)} in parallel; return failed part numbers."""
+    failed: set[int] = set()
+    if not jobs:
+        return failed
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(jobs)))) as ex:
+        futs = {ex.submit(download_to_s3, session, path, bucket, key): part
+                for part, (path, key) in jobs.items()}
+        for fut in as_completed(futs):
+            part = futs[fut]
+            try:
+                if not fut.result():
+                    failed.add(part)
+            except Exception as exc:  # noqa: BLE001
+                log.error("part %s download failed: %s", part, exc)
+                failed.add(part)
+    return failed
 
 
 def retry_call(fn, *a, tries: int = 5, what: str = "request"):
@@ -267,14 +335,14 @@ def generate_batches(cli: EciClient, roll: dict, ac: int, dcd: str | None,
 
 
 def run_round(cli: EciClient, roll: dict, ac: int, dcd: str | None,
-              pending: list[int], lang: str, jobs: dict[int, Path],
+              pending: list[int], lang: str, keys: dict[int, str], ac_dir: Path,
               args, man: Manifest) -> set[int]:
     """One round: generate fresh fileIds for `pending` and fetch them all.
     Returns the parts still missing."""
     batches = list(_chunks(pending, max(1, args.batch)))
     q: "queue.Queue" = queue.Queue(maxsize=1)
     prod = threading.Thread(target=generate_batches, daemon=True,
-                            args=(cli, roll, ac, dcd, batches, lang, jobs[pending[0]].parent,
+                            args=(cli, roll, ac, dcd, batches, lang, ac_dir,
                                   args.env_file, args.captcha_tries, q))
     prod.start()
 
@@ -294,8 +362,8 @@ def run_round(cli: EciClient, roll: dict, ac: int, dcd: str | None,
 
         def _one(pi: tuple[int, str]) -> tuple[int, bool]:
             part, item_id = pi
-            got = (download(cli.s, item_id, jobs[part], attempts=1) if via_cdn
-                   else fetch_file(cli, item_id, jobs[part]))
+            got = (download_to_s3(cli.s, item_id, args.s3_bucket, keys[part], attempts=1)
+                   if via_cdn else fetch_file(cli, item_id, args.s3_bucket, keys[part]))
             return part, got
 
         t0 = time.time()
@@ -326,16 +394,15 @@ def process_ac(cli: EciClient, roll: dict, ac: int, dcd: str | None, state_cd: s
         log.warning("AC %s: no booths listed", ac)
         return 0, 0
 
+    # base_out is a small local dir for the resumable manifest + occasional
+    # captcha debug image only — PDFs never land here, they go straight to S3.
     ac_dir = base_out / str(ac)
     man = Manifest(ac_dir / "_manifest.json")
-    jobs = {p: ac_dir / f"booth_{p:04d}.pdf" for p in parts}
+    s3_prefix = f"{state_cd}/{str(roll['id']).lower()}/{ac}"
+    keys = {p: f"{s3_prefix}/booth_{p:04d}.pdf" for p in parts}
 
-    # trust the filesystem over the manifest: a file on disk is done
-    for p in parts:
-        if jobs[p].exists() and jobs[p].stat().st_size > MIN_PDF_BYTES:
-            man.mark_done(p)
     pending = [p for p in parts if p not in man.done]
-    log.info("AC %s: %d booths, %d already have PDFs, %d to fetch (lang %s)",
+    log.info("AC %s: %d booths, %d already in S3, %d to fetch (lang %s)",
              ac, len(parts), len(parts) - len(pending), len(pending), lang)
     if args.report:
         stuck = [p for p in pending if man.attempts(p) >= 3]
@@ -348,17 +415,17 @@ def process_ac(cli: EciClient, roll: dict, ac: int, dcd: str | None, state_cd: s
 
     # CDN first: on a pre-generated roll (UP SIR) this finishes the whole AC.
     if not args.no_cdn:
-        probe = {p: (cdn_path(roll, ac, p, lang), jobs[p]) for p in pending[:3]}
-        missed = base.download_batch(cli.s, probe, args.workers)
+        probe = {p: (cdn_path(roll, ac, p, lang), keys[p]) for p in pending[:3]}
+        missed = download_batch_to_s3(cli.s, probe, args.s3_bucket, args.workers)
         for p in probe:
             man.mark_attempt(p)
             if p not in missed:
                 man.mark_done(p)
         if len(missed) < len(probe):
             log.info("AC %s: roll is on the CDN — downloading all booths directly", ac)
-            rest = {p: (cdn_path(roll, ac, p, lang), jobs[p])
+            rest = {p: (cdn_path(roll, ac, p, lang), keys[p])
                     for p in pending if p not in probe}
-            still = base.download_batch(cli.s, rest, args.workers)
+            still = download_batch_to_s3(cli.s, rest, args.s3_bucket, args.workers)
             for p in rest:
                 man.mark_attempt(p)
                 if p not in still:
@@ -378,7 +445,7 @@ def process_ac(cli: EciClient, roll: dict, ac: int, dcd: str | None, state_cd: s
         # a stuck booth from soaking up every round
         pending.sort(key=lambda p: (man.attempts(p), p))
         before = len(pending)
-        pending = sorted(run_round(cli, roll, ac, dcd, pending, lang, jobs, args, man))
+        pending = sorted(run_round(cli, roll, ac, dcd, pending, lang, keys, ac_dir, args, man))
         gained = before - len(pending)
         log.info("AC %s: round %d/%d +%d booth(s), %d still missing (%.0fs elapsed)",
                  ac, rnd, args.rounds, gained, len(pending), time.time() - t0)
@@ -414,7 +481,12 @@ def main() -> None:
     ap.add_argument("--all-acs", action="store_true", help="Every AC in --district")
     ap.add_argument("--lang")
     ap.add_argument("--parts", help="Booth subset, e.g. '1-50'")
-    ap.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "booth_list_pdf")
+    ap.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "booth_list_pdf",
+                    help="Local dir for the resumable per-AC manifest + captcha debug "
+                         "images only. Booth PDFs never land here — they go to S3.")
+    ap.add_argument("--s3-bucket", default="electoral-roll-pdfs",
+                    help="S3 bucket booth PDFs are uploaded to (default electoral-roll-pdfs). "
+                         "Key layout: <stateCd>/<rollId>/<ac>/booth_<part>.pdf")
     ap.add_argument("--workers", type=int, default=8,
                     help="Parallel fetches (default 8). Hit rate is unaffected by "
                          "concurrency, so this is close to a free speedup.")
@@ -434,8 +506,9 @@ def main() -> None:
     args = ap.parse_args()
 
     load_env_files(args.env_file)
-    global FETCH_SESSION
+    global FETCH_SESSION, S3_CLIENT
     FETCH_SESSION = fetch_session(max(4, args.workers))
+    S3_CLIENT = boto3.client("s3", region_name=S3_REGION)
     cli = EciClient(pool_size=max(4, args.workers))
 
     state = _match(cli.states(), args.state, "stateName", "stateCd")
@@ -546,8 +619,8 @@ def main() -> None:
     if failed_acs:
         log.warning("ACs that errored out entirely: %s",
                     ", ".join(map(str, failed_acs)))
-    log.info("Total: %d booth PDFs on disk, %d still missing. Output under %s",
-             total_have, total_left, base_out)
+    log.info("Total: %d booth PDFs in s3://%s/%s, %d still missing. Manifests under %s",
+             total_have, args.s3_bucket, state_cd, total_left, base_out)
     if total_left:
         log.info("Re-run the same command later to pick up more — these rolls "
                  "release booths gradually across runs.")
