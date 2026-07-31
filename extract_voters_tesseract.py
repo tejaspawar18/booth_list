@@ -121,6 +121,11 @@ repairs are recorded in the flags column so rows stay auditable:
   one that is common on the page is rewritten to it (epic_prefix_fixed). The
   digits cannot be voted on, so an EPIC of the wrong shape is only flagged
   (epic_bad / epic_length) -- check those against the PDF.
+- an EPIC is always <letters><digits> nationwide, so a digit-shaped glyph in
+  the letter zone or a letter-shaped glyph in the digit zone is rewritten to
+  its twin (epic_glyph_fixed) before the checks above run. I<->1 and O<->0
+  are near-total confusions on some fonts (measured 557 and 237 char errors
+  on one AC's ground truth); Z/S/B/G/Y<->2/5/8/6/7 are the same shape family.
 
 Other flags: age_bad (outside 18-120), name_missing, epic_missing.
 
@@ -214,6 +219,9 @@ GENDER_CANON = {"male": "Male", "female": "Female", "third gender": "Third Gende
 DIGIT_FIX = str.maketrans({"O": "0", "o": "0", "D": "0", "Q": "0", "I": "1", "l": "1",
                            "|": "1", "/": "7", "S": "5", "B": "8", "Z": "2"})
 EPIC_RE = re.compile(r"^[A-Z]{2,4}[0-9]{6,9}$")
+# Natural letters/digits boundary, independent of the page's modal digit count -
+# used to recover the prefix when a digit has been dropped (see repair_epics).
+EPIC_NATURAL_SPLIT = re.compile(r"^([A-Z]+)([0-9]+)$")
 # tesseract renders a capital I as one of these inside a word
 I_CONFUSIONS = re.compile(r"[|!\]\[]")
 
@@ -607,7 +615,8 @@ def gender_from_lines(lines: list[str]) -> str:
 
 def arbitrate(primary: dict[str, str], secondary: dict[str, str],
               conf_primary: float, conf_secondary: float,
-              fields: tuple[str, ...] = ("name", "relation_name")) -> tuple[dict[str, str], list[str]]:
+              fields: tuple[str, ...] = ("name", "relation_name"),
+              simple_fields: tuple[str, ...] = ("age", "gender")) -> tuple[dict[str, str], list[str]]:
     """Merge two models' readings of the same card.
 
     The installed integer model and the tessdata_best float model make different
@@ -632,6 +641,19 @@ def arbitrate(primary: dict[str, str], secondary: dict[str, str],
         score_a = sum(t.upper() in pool for t in a.split())
         score_b = sum(t.upper() in pool for t in b.split())
         if score_b > score_a or (score_b == score_a and conf_secondary > conf_primary):
+            merged[field] = b
+        flags.append(f"{field}_arbitrated")
+    # age/gender have no corroborating field to vote with, so a disagreement
+    # is just flagged (confidence tie-breaks). Previously age/gender were read
+    # from primary alone with no cross-model check at all, so a wrong read
+    # carried no signal unless it also failed the age_bad range check - the
+    # in-range age misreads and both gender misreads found on AC 216 ground
+    # truth were completely silent before this.
+    for field in simple_fields:
+        a, b = primary.get(field, ""), secondary.get(field, "")
+        if a == b or a == "" or b == "":
+            continue
+        if conf_secondary > conf_primary:
             merged[field] = b
         flags.append(f"{field}_arbitrated")
     return merged, flags
@@ -718,35 +740,81 @@ def _edit_distance(a: str, b: str) -> int:
     return prev[-1]
 
 
+# Glyphs tesseract routinely confuses between the letter and digit forms.
+# Measured on AC 216 (910-card ground truth): I->1 was 557 of ~800 EPIC char
+# errors and O->0 was 237 - both close to total confusion (nearly every I/O in
+# the crop reads as 1/0). Z/S/B/G/Y are the same shape family and worth fixing
+# on sight even though they were single-digit counts in that sample.
+EPIC_LETTER_TO_DIGIT = {"O": "0", "I": "1", "Z": "2", "S": "5", "B": "8", "G": "6", "Y": "7"}
+EPIC_DIGIT_TO_LETTER = {v: k for k, v in EPIC_LETTER_TO_DIGIT.items()}
+
+
+def fix_epic_glyphs(epic: str, head_len: int = 3) -> tuple[str, bool]:
+    """Rewrite characters that violate the <letters><digits> shape: a digit-like
+    glyph in the letter zone becomes its letter twin, and vice versa in the
+    digit zone. head_len defaults to 3 (the nationwide EPIC prefix length)."""
+    if len(epic) <= head_len:
+        return epic, False
+    head, tail = epic[:head_len], epic[head_len:]
+    new_head = "".join(EPIC_DIGIT_TO_LETTER.get(c, c) if c.isdigit() else c for c in head)
+    new_tail = "".join(EPIC_LETTER_TO_DIGIT.get(c, c) if c.isalpha() else c for c in tail)
+    fixed = new_head + new_tail
+    return fixed, fixed != epic
+
+
 def repair_epics(epics: list[str]) -> tuple[list[str], list[str]]:
     """An EPIC is <letters><digits> and a booth uses only a handful of prefixes,
     so the prefix can be voted on: anything within 2 edits of a prefix that is
     common on this page is rewritten to it. The digits cannot be voted on, so an
     EPIC whose digit count is off the page's mode is flagged rather than fixed."""
+    glyph_fixed = [False] * len(epics)
+    fixed_epics = []
+    for i, e in enumerate(epics):
+        fixed, changed = fix_epic_glyphs(e)
+        fixed_epics.append(fixed)
+        glyph_fixed[i] = changed
+    epics = fixed_epics
     well_formed = [e for e in epics if EPIC_RE.match(e)]
     common = {p for p, n in Counter(e[:3] for e in well_formed).items() if n >= 3}
     digit_counts = Counter(len(e) - 3 for e in well_formed).most_common(1)
     modal_digits = digit_counts[0][0] if digit_counts else 0
 
     out, flags = [], []
-    for epic in epics:
+    for epic, was_glyph_fixed in zip(epics, glyph_fixed):
+        glyph_flag = "epic_glyph_fixed" if was_glyph_fixed else ""
         if not epic:
             out.append("")
-            flags.append("epic_missing")
+            flags.append(";".join(f for f in (glyph_flag, "epic_missing") if f))
             continue
-        head, tail = epic[:-modal_digits], epic[-modal_digits:] if modal_digits else ("", "")
-        if common and modal_digits and tail.isdigit() and head not in common:
+        # Natural split first: a dropped/merged digit shifts the fixed-width
+        # modal_digits boundary into the letters, so that split's tail stops
+        # being pure digits and the vote below never fires (this is the case
+        # that let "IOG963656" go unflagged as fixable - Y misread as G, plus
+        # a lost digit - even though "IOG" is within 2 edits of "IYO").
+        m = EPIC_NATURAL_SPLIT.match(epic)
+        head, tail = (m.group(1), m.group(2)) if m else (
+            epic[:-modal_digits], epic[-modal_digits:] if modal_digits else "")
+        if common and tail.isdigit() and head not in common:
             near = sorted((_edit_distance(p, head), p) for p in common)
             if near and near[0][0] <= 2 and (len(near) == 1 or near[1][0] > near[0][0]):
-                out.append(near[0][1] + tail)
-                flags.append("epic_prefix_fixed")
+                # The prefix vote only replaces the letters; a short tail (a
+                # digit the crop lost entirely) is a separate problem it can't
+                # fix, so that still needs to carry epic_length through to the
+                # escalation rule rather than being marked clean.
+                epic = near[0][1] + tail
+                length_flag = ("epic_length" if modal_digits and len(tail) != modal_digits
+                               else "")
+                out.append(epic)
+                flags.append(";".join(f for f in (glyph_flag, "epic_prefix_fixed", length_flag)
+                                      if f))
                 continue
         if not EPIC_RE.match(epic):
             out.append(epic)
-            flags.append("epic_bad")
+            flags.append(";".join(f for f in (glyph_flag, "epic_bad") if f))
             continue
         out.append(epic)
-        flags.append("epic_length" if modal_digits and len(epic) - 3 != modal_digits else "")
+        length_flag = "epic_length" if modal_digits and len(epic) - 3 != modal_digits else ""
+        flags.append(";".join(f for f in (glyph_flag, length_flag) if f))
     return out, flags
 
 
@@ -931,8 +999,13 @@ def main() -> None:
     ap.add_argument("--dpi", type=int, default=200, help="Render DPI (200 reads best here)")
     # these three defaults were tuned on a page of AC 228; the padding matters most
     ap.add_argument("--epic-psm", type=int, default=8, help="Tesseract PSM for the EPIC number")
-    ap.add_argument("--epic-scale", type=int, default=3, help="Upscale factor for the EPIC crop")
-    ap.add_argument("--epic-pad", type=int, default=25, help="Padding around the EPIC ink crop")
+    ap.add_argument("--epic-scale", type=int, default=7,
+                    help="Upscale factor for the EPIC crop only (page --dpi is separate - "
+                         "raising that instead regressed other fields whose crop math is "
+                         "tuned for it). Swept 3/5/7/10 on AC 216 ground truth: "
+                         "epic_number exact match 85.6%% / 92.4%% / 93.3%% / 92.2%% - 7 is "
+                         "the peak, 10 over-upscales (blur) and is slower for a worse result.")
+    ap.add_argument("--epic-pad", type=int, default=35, help="Padding around the EPIC ink crop")
     ap.add_argument("--engine", default="tesseract", choices=sorted(ENGINES),
                     help="OCR engine: tesseract (CPU, default) or easyocr "
                          "(torch; uses CUDA/MPS when present)")
