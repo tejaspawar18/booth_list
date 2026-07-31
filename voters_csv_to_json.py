@@ -92,15 +92,19 @@ def main() -> None:
     seen_names: dict[str, str] = {}
     for booth_pdf, rows in by_booth.items():
         payload = build_booth_json(booth_pdf, rows, args.state_cd, args.roll_id, args.ac)
-        # Named by part_no, not the booth PDF filename: two booth PDFs can be
-        # duplicate/re-scanned uploads of the same electoral part, and keying
-        # on part_no lets a later upload naturally supersede an earlier one
-        # instead of both landing under different, undeduped keys.
+        # Named by part_no, not the booth PDF filename, so a genuine
+        # re-scan of the same electoral part lands under a predictable key.
+        # extract_voters_tesseract.py's pre-scan already drops duplicate
+        # PDFs before OCR, so a collision here should be rare - but this
+        # never silently overwrites: a second PDF claiming the same part_no
+        # gets the booth filename appended so both are kept for review.
         part_no = (payload["part_no"] or "").strip().replace("/", "_")
         name = part_no or Path(booth_pdf).stem
         if name in seen_names:
+            distinguished = f"{name}__{Path(booth_pdf).stem}"
             print(f"WARNING: part_no {name!r} from {booth_pdf} collides with "
-                  f"{seen_names[name]} - {booth_pdf} will overwrite it at the same key")
+                  f"{seen_names[name]} - keeping both, this one uploads as {distinguished}.json")
+            name = distinguished
         seen_names[name] = booth_pdf
         key = f"{args.state_cd}/{args.roll_id}/{args.ac}/{name}.json"
         if args.out_dir:

@@ -865,7 +865,11 @@ def process_page(gray: np.ndarray, pdf_name: str, page_no: int, ac_no: str,
         rows.append({
             "booth_pdf": pdf_name, "page_no": page_no,
             "ac_no": _digits(ac_no), "section_no": header["section_no"],
-            "section_name": header["section_name"], "part_no": part_no,
+            "section_name": header["section_name"],
+            # the printed part number is the true identifier - it does not
+            # always match the sequential booth filename (see the warning
+            # above), which is only a fallback when the header OCR misses it
+            "part_no": header["part_no"] or part_no,
             "serial_no": _digits(serial_txt, repair=False),
             "epic_number": re.sub(r"[^A-Z0-9]", "", epic_txt.upper()),
             "name": fields["name"], "relation_type": fields["relation_type"],
@@ -899,6 +903,30 @@ def process_page(gray: np.ndarray, pdf_name: str, page_no: int, ac_no: str,
                                                 "relation_type", "relation_name",
                                                 "house_number", "age", "gender", "marker")})
     return rows, page_row
+
+
+def read_part_no_only(pdf_path: Path, first_page: int, opts: dict[str, Any]) -> str:
+    """Cheaply read the printed part number off a booth's first elector page
+    header only - one small OCR call, not the ~30-card full-page pass. Used
+    to find PDFs that are duplicate scans of the same electoral part under a
+    different filename before spending full OCR on them: the printed number
+    is the true identifier, and it does not always match the sequential
+    booth filename (see the "printed part number != filename part number"
+    warning in process_page)."""
+    if _OPS is None:
+        worker_init(opts)
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if first_page > len(pdf.pages):
+                return ""
+            gray = page_gray(pdf, first_page, opts["dpi"])
+    except Exception:  # noqa: BLE001 - a truncated download should not stop the pre-scan
+        return ""
+    comps = rect_components(gray)
+    cards = find_cards(comps, gray.shape)
+    header_bottom = min((c[1] for c in cards), default=int(0.06 * gray.shape[0]))
+    header_lines, _hc = engine().block(gray[: max(1, header_bottom - 4), :], psm=6)
+    return parse_header(header_lines)["part_no"]
 
 
 def process_chunk(pdf_path: Path, pages: list[int], ac_no: str, opts: dict[str, Any]
@@ -1032,6 +1060,10 @@ def main() -> None:
     ap.add_argument("--flush-every", type=int, default=25,
                     help="Write the CSVs every N pages (default 25)")
     ap.add_argument("--refresh", action="store_true", help="Ignore existing output and redo all pages")
+    ap.add_argument("--no-dedup-scan", action="store_true",
+                    help="Skip the pre-scan that finds booth PDFs printing the same part "
+                         "number under a different filename and drops the full OCR pass "
+                         "on the duplicates")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
@@ -1067,6 +1099,13 @@ def main() -> None:
                      "githubusercontent.com/tesseract-ocr/tessdata_best/main/%s.traineddata",
                      best_dir, best_dir, args.lang.split('+')[0], args.lang.split('+')[0])
 
+    opts = {"tesseract": tesseract, "lang": args.lang, "dpi": args.dpi,
+            "epic_psm": args.epic_psm, "epic_scale": args.epic_scale,
+            "epic_pad": args.epic_pad, "debug": args.debug, "device": device,
+            "retries": args.retries, "ocr_timeout": args.ocr_timeout,
+            "engine": args.engine, "batch_size": args.batch_size,
+            "best_tessdata": best_tessdata}
+
     pdfs = sorted(pdf_dir.glob("booth_*.pdf"))
     if not pdfs:
         raise SystemExit(f"No booth_*.pdf files in {pdf_dir}")
@@ -1079,6 +1118,42 @@ def main() -> None:
         pdfs = pdfs[: args.limit]
     if not pdfs:
         raise SystemExit("no booth PDFs selected")
+
+    # Cheap pre-scan: read just the printed part number off each booth's
+    # first elector page header (one small OCR call, not the ~30-card full
+    # pass) to find PDFs that are duplicate scans of the same electoral part
+    # under a different filename, and skip full OCR on the duplicates
+    # entirely rather than pay for it and dedup after the fact.
+    if not args.no_dedup_scan:
+        log.info("pre-scanning %d booths for duplicate part numbers...", len(pdfs))
+        prescan_workers = max(1, min(args.workers, len(pdfs)))
+        seen_parts: dict[str, Path] = {}
+        dup_rows: list[dict[str, str]] = []
+        kept: list[Path] = []
+        with ProcessPoolExecutor(max_workers=prescan_workers, initializer=worker_init,
+                                 initargs=(opts,)) as ex:
+            futs = {ex.submit(read_part_no_only, pdf, args.first_page, opts): pdf for pdf in pdfs}
+            for fut in as_completed(futs):
+                pdf = futs[fut]
+                try:
+                    part_no = fut.result()
+                except Exception as exc:  # noqa: BLE001 - a bad header read should not block a booth
+                    log.warning("%s: part-number pre-scan failed (%s) - processing anyway", pdf.name, exc)
+                    part_no = ""
+                if part_no and part_no in seen_parts:
+                    log.warning("%s: printed part_no %s already covered by %s - skipping full OCR",
+                                pdf.name, part_no, seen_parts[part_no].name)
+                    dup_rows.append({"booth_pdf": pdf.name, "part_no": part_no,
+                                     "kept_booth_pdf": seen_parts[part_no].name})
+                    continue
+                if part_no:
+                    seen_parts[part_no] = pdf
+                kept.append(pdf)
+        if dup_rows:
+            dup_path = out_csv.with_suffix(".duplicate_parts.csv")
+            write_csv(dup_path, ["booth_pdf", "part_no", "kept_booth_pdf"], dup_rows)
+            log.info("skipped %d duplicate-part booth(s), full list in %s", len(dup_rows), dup_path)
+        pdfs = sorted(kept)
 
     rows = [] if args.refresh else read_csv_rows(out_csv, COLUMNS)
     page_rows = [] if args.refresh else read_csv_rows(pages_csv, PAGE_COLUMNS)
@@ -1115,12 +1190,6 @@ def main() -> None:
         1, min(8, -(-total_pages // max(1, (args.workers or 1) * 3))))
     tasks = [(pdf, chunk) for pdf, pages in todo for chunk in chunked(pages, chunk_size)]
 
-    opts = {"tesseract": tesseract, "lang": args.lang, "dpi": args.dpi,
-            "epic_psm": args.epic_psm, "epic_scale": args.epic_scale,
-            "epic_pad": args.epic_pad, "debug": args.debug, "device": device,
-            "retries": args.retries, "ocr_timeout": args.ocr_timeout,
-            "engine": args.engine, "batch_size": args.batch_size,
-            "best_tessdata": best_tessdata}
     workers = max(1, min(args.workers, len(tasks)))
     if args.engine == "easyocr" and device == "gpu":
         # one torch model per process, and the GPU is the bottleneck, not the cores

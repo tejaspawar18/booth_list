@@ -11,7 +11,8 @@
 #   ./run_voter_pipeline.sh $(seq 216 227)
 #
 # Env overrides: STATE_CD, ROLL_ID, SRC_BUCKET, DST_BUCKET, OCR_WORKERS,
-# ESC_WORKERS, DL_WORKERS, ESC_RULE, ESC_BATCH, KEEP_LOCAL=1 (skip cleanup).
+# ESC_WORKERS, DL_WORKERS, ESC_RULE, ESC_BATCH, KEEP_LOCAL=1 (skip cleanup),
+# SKIP_ESCALATION=1 (Tesseract-only, no Gemini calls at all).
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 
@@ -31,6 +32,7 @@ DL_WORKERS="${DL_WORKERS:-32}"
 ESC_RULE="${ESC_RULE:-flags:epic_length,flags:epic_bad,flags:age_bad,flags:age_arbitrated}"
 ESC_BATCH="${ESC_BATCH:-15}"
 KEEP_LOCAL="${KEEP_LOCAL:-0}"
+SKIP_ESCALATION="${SKIP_ESCALATION:-0}"
 
 PY=".venv/bin/python"
 ENV_FILE="/home/ubuntu/.env"
@@ -70,27 +72,32 @@ for ac in "${ACS[@]}"; do
   fi
 
   HYBRID_CSV="booth_list_csv/voters_${ac}_hybrid.csv"
-  log "----- AC $ac: Gemini escalation (rule: $ESC_RULE) -----"
-  if ! $PY escalate_voters_gemini.py --csv "$TESS_CSV" --pdf-dir "$PDF_DIR" \
-        --rule "$ESC_RULE" --batch-size "$ESC_BATCH" --env-file "$ENV_FILE" \
-        --workers "$ESC_WORKERS" --out "$HYBRID_CSV" 2>&1 | tee -a "$LOG"; then
-    log "AC $ac: escalation failed, falling back to Tesseract-only CSV"
+  if [ "$SKIP_ESCALATION" = "1" ]; then
+    log "----- AC $ac: skipping Gemini escalation (SKIP_ESCALATION=1) -----"
     HYBRID_CSV="$TESS_CSV"
-  fi
+  else
+    log "----- AC $ac: Gemini escalation (rule: $ESC_RULE) -----"
+    if ! $PY escalate_voters_gemini.py --csv "$TESS_CSV" --pdf-dir "$PDF_DIR" \
+          --rule "$ESC_RULE" --batch-size "$ESC_BATCH" --env-file "$ENV_FILE" \
+          --workers "$ESC_WORKERS" --out "$HYBRID_CSV" 2>&1 | tee -a "$LOG"; then
+      log "AC $ac: escalation failed, falling back to Tesseract-only CSV"
+      HYBRID_CSV="$TESS_CSV"
+    fi
 
-  # A batch occasionally comes back short (see escalate_voters_gemini.py);
-  # one smaller-batch retry on just the gaps recovers those for a few cents.
-  MISSING=$($PY - "$HYBRID_CSV" <<'PYEOF'
+    # A batch occasionally comes back short (see escalate_voters_gemini.py);
+    # one smaller-batch retry on just the gaps recovers those for a few cents.
+    MISSING=$($PY - "$HYBRID_CSV" <<'PYEOF'
 import csv, sys
 with open(sys.argv[1], encoding="utf-8-sig") as f:
     print(sum(1 for r in csv.DictReader(f) if "gemini_missing" in r.get("flags", "")))
 PYEOF
 )
-  if [ "${MISSING:-0}" -gt 0 ]; then
-    log "AC $ac: retrying $MISSING gemini_missing cards with a smaller batch"
-    $PY escalate_voters_gemini.py --csv "$HYBRID_CSV" --pdf-dir "$PDF_DIR" \
-        --rule "flags:gemini_missing" --batch-size 10 --env-file "$ENV_FILE" \
-        --workers "$ESC_WORKERS" --out "$HYBRID_CSV" 2>&1 | tee -a "$LOG"
+    if [ "${MISSING:-0}" -gt 0 ]; then
+      log "AC $ac: retrying $MISSING gemini_missing cards with a smaller batch"
+      $PY escalate_voters_gemini.py --csv "$HYBRID_CSV" --pdf-dir "$PDF_DIR" \
+          --rule "flags:gemini_missing" --batch-size 10 --env-file "$ENV_FILE" \
+          --workers "$ESC_WORKERS" --out "$HYBRID_CSV" 2>&1 | tee -a "$LOG"
+    fi
   fi
 
   log "----- AC $ac: JSON -> s3://$DST_BUCKET/$STATE_CD/$ROLL_ID/$ac/ -----"
