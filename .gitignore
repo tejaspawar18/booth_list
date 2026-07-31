@@ -9,6 +9,7 @@ booth_list_pdf/
 booth_list_csv/
 localities/
 localities_map/
+validation/
 
 # Third-party OCR model data (large, re-downloadable)
 tessdata_best/
