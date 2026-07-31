@@ -204,11 +204,20 @@ def fetch_file(cli: EciClient, file_id: str, bucket: str, key: str) -> bool:
     return s3_put(bucket, key, raw)
 
 
+# After a batch where a large share of fetches got the edge's cached-403
+# "throttled" response, a short cooldown before the next batch/round gives the
+# ~10-min edge cache a chance to age out instead of every worker immediately
+# retripping it again on the very next request.
+THROTTLE_COOLDOWN_FRACTION = 0.3
+THROTTLE_COOLDOWN_SECONDS = 15.0
+
+
 def download_to_s3(session: requests.Session, path: str, bucket: str, key: str,
-                   attempts: int = 4) -> bool:
+                   attempts: int = 4) -> tuple[bool, bool]:
     """CDN-backed fetch, uploaded straight to S3 — the S3 equivalent of
     download_eci_rolls.download(), used instead of it so no PDF ever hits
-    local disk."""
+    local disk. Returns (ok, throttled) — throttled is True when the fetch
+    gave up because of the edge's cached 403, so callers can add a cooldown."""
     url = f"{base.CDN_ROOT}/{path}"
     for attempt in range(attempts):
         try:
@@ -218,12 +227,12 @@ def download_to_s3(session: requests.Session, path: str, bucket: str, key: str,
                 time.sleep(2 ** attempt + random.uniform(0, 1))
                 continue
             log.warning("CDN error for %s (%s)", path, exc)
-            return False
+            return False, False
         if r.status_code == 200 and r.content[:4] == b"%PDF":
             if not s3_put(bucket, key, r.content):
-                return False
+                return False, False
             log.info("uploaded s3://%s/%s (%.1f MB)", bucket, key, len(r.content) / 1e6)
-            return True
+            return True, False
         if r.status_code in base._RETRY_STATUS and attempt < attempts - 1:
             # 403 is edge throttling; back off harder (and jitter) so parallel
             # workers don't re-trip the limit in lockstep
@@ -232,8 +241,16 @@ def download_to_s3(session: requests.Session, path: str, bucket: str, key: str,
             continue
         note = "throttled (edge 403)" if r.status_code == 403 else f"HTTP {r.status_code}"
         log.warning("CDN miss for %s (%s)", path, note)
-        return False
-    return False
+        return False, r.status_code == 403
+    return False, False
+
+
+def _throttle_cooldown(throttled: int, total: int) -> None:
+    if total and throttled / total >= THROTTLE_COOLDOWN_FRACTION:
+        log.warning("%d/%d fetches hit the CDN edge throttle this batch; "
+                    "cooling down %.0fs before the next one",
+                    throttled, total, THROTTLE_COOLDOWN_SECONDS)
+        time.sleep(THROTTLE_COOLDOWN_SECONDS)
 
 
 def download_batch_to_s3(session: requests.Session, jobs: dict[int, tuple[str, str]],
@@ -242,17 +259,22 @@ def download_batch_to_s3(session: requests.Session, jobs: dict[int, tuple[str, s
     failed: set[int] = set()
     if not jobs:
         return failed
+    throttled = 0
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(jobs)))) as ex:
         futs = {ex.submit(download_to_s3, session, path, bucket, key): part
                 for part, (path, key) in jobs.items()}
         for fut in as_completed(futs):
             part = futs[fut]
             try:
-                if not fut.result():
+                ok, was_throttled = fut.result()
+                if was_throttled:
+                    throttled += 1
+                if not ok:
                     failed.add(part)
             except Exception as exc:  # noqa: BLE001
                 log.error("part %s download failed: %s", part, exc)
                 failed.add(part)
+    _throttle_cooldown(throttled, len(jobs))
     return failed
 
 
@@ -360,23 +382,30 @@ def run_round(cli: EciClient, roll: dict, ac: int, dcd: str | None,
             log.warning("AC %s: portal generated nothing for %d booth(s)", ac, len(chunk))
             continue
 
-        def _one(pi: tuple[int, str]) -> tuple[int, bool]:
+        def _one(pi: tuple[int, str]) -> tuple[int, bool, bool]:
             part, item_id = pi
-            got = (download_to_s3(cli.s, item_id, args.s3_bucket, keys[part], attempts=1)
-                   if via_cdn else fetch_file(cli, item_id, args.s3_bucket, keys[part]))
-            return part, got
+            if via_cdn:
+                got, throttled = download_to_s3(cli.s, item_id, args.s3_bucket,
+                                                keys[part], attempts=1)
+            else:
+                got, throttled = fetch_file(cli, item_id, args.s3_bucket, keys[part]), False
+            return part, got, throttled
 
         t0 = time.time()
         with ThreadPoolExecutor(max_workers=max(1, min(args.workers, len(pairs)))) as ex:
             results = list(ex.map(_one, pairs))
         won = 0
-        for part, got in results:
+        throttled_n = 0
+        for part, got, was_throttled in results:
             man.mark_attempt(part)
             if got:
                 man.mark_done(part)
                 still.discard(part)
                 won += 1
+            if was_throttled:
+                throttled_n += 1
         man.save()
+        _throttle_cooldown(throttled_n, len(results))
         log.info("AC %s: batch %d booths -> %d saved (%.1fs/booth)",
                  ac, len(pairs), won, (time.time() - t0) / max(1, len(pairs)))
     return still

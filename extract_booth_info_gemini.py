@@ -3,7 +3,7 @@ Extract page-1 booth details from ECI booth-roll PDFs using Gemini vision.
 
 This is the cloud/Gemini alternative to extract_booth_info.py. It sends page 1
 as an image to the Gemini API (Interactions API) and asks for one strict JSON
-object matching the same booth_info_<AC>.csv columns.
+object matching the same admin_details_<AC>.csv columns.
 
 Credentials
 -----------
@@ -27,7 +27,7 @@ Usage
     $PY extract_booth_info_gemini.py --ac 324 --parts 25,26,37,38,40,46,51 --debug
     $PY extract_booth_info_gemini.py --ac 324 --workers 4
     $PY extract_booth_info_gemini.py --ac 324 --backend vertex --sa-key key.json
-    $PY extract_booth_info_gemini.py --pdf-dir booth_list_pdf/324 --out booth_list_csv/booth_info_gemini_324.csv
+    $PY extract_booth_info_gemini.py --pdf-dir booth_list_pdf/324 --out booth_list_csv/admin_details_324.csv
 
 Notes
 -----
@@ -68,10 +68,15 @@ import urllib.request
 import warnings
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+import boto3
 import pdfplumber
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -86,28 +91,52 @@ DEFAULT_OUTPUT_PRICE_PER_M = 3.00
 DEFAULT_CACHED_PRICE_PER_M = 0.05
 DEV_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
 
+# Booth PDFs live in S3 (uploaded by download_eci_rolls_fast.py) and the
+# extracted CSV goes back to S3 too; nothing booth-related touches local
+# disk except the per-AC panchayat cache and the local-only usage log below.
+S3_REGION = "ap-south-1"
+DEFAULT_IN_S3_BUCKET = "electoral-roll-pdfs"
+DEFAULT_OUT_S3_BUCKET = "electoral-admin-detail"
+DEFAULT_LOG_FILE = Path("/home/ubuntu/gemini_extract.log")
+DEFAULT_USAGE_CSV = Path("/home/ubuntu/gemini_usage_ac.csv")
+
 NUM_FIELDS = ["part_no", "ac_no", "pc_no", "revision_year", "qualifying_date",
               "publication_date", "pin_code", "start_serial", "end_serial",
               "male", "female", "third_gender", "total", "counts_ok"]
 HIN_FIELDS = ["ac_name", "pc_name", "revision_type", "sections", "main_town_village",
               "ward", "post_office", "police_station", "panchayat", "block", "tehsil",
               "district", "ps_no_name", "ps_address", "ps_type"]
+# GPS coordinates printed on page 2's "Google Map View" panel (LAT-/LONG- under
+# the satellite image). Decimal-degree strings, not floats, so we keep exactly
+# what's printed rather than risk silent precision loss.
+MAP_FIELDS = ["map_lat", "map_long"]
 # derived after all booths in the AC are extracted, not read off any single image
 DERIVED_FIELDS = ["panchayat_clean"]
+# Token usage is tracked per booth in memory (for the AC-wise aggregate below)
+# but deliberately never written into the booth-wise CSV that goes to S3.
 USAGE_FIELDS = ["input_tokens", "output_tokens", "thought_tokens", "cached_tokens",
                 "total_tokens", "approx_cost_usd"]
-EXTRACT_COLUMNS = ["booth_pdf", "total_pages"] + NUM_FIELDS + HIN_FIELDS + DERIVED_FIELDS
-COLUMNS = EXTRACT_COLUMNS + USAGE_FIELDS
+EXTRACT_COLUMNS = (["booth_pdf", "total_pages"] + NUM_FIELDS + HIN_FIELDS
+                   + MAP_FIELDS + DERIVED_FIELDS)
+COLUMNS = EXTRACT_COLUMNS
+# AC-wise token-usage CSV: one row per script invocation that did real Gemini
+# calls. Local only (DEFAULT_USAGE_CSV), never uploaded to S3.
+AC_USAGE_COLUMNS = ["timestamp", "ac_no", "booths_processed", "booths_failed",
+                    "workers", "input_tokens", "output_tokens", "thought_tokens",
+                    "cached_tokens", "total_tokens", "approx_cost_usd",
+                    "avg_cost_per_booth"]
 
 # Fields the model must read off the image. part_no/ac_no/counts_ok/booth_pdf/
 # total_pages are derived locally, so asking the model for them only spends
 # output tokens — except part_no, kept as a cheap cross-check against the
 # filename-derived part number.
 MODEL_NUM_FIELDS = [f for f in NUM_FIELDS if f not in {"ac_no", "counts_ok"}]
-MODEL_FIELDS = MODEL_NUM_FIELDS + HIN_FIELDS
+MODEL_FIELDS = MODEL_NUM_FIELDS + HIN_FIELDS + MAP_FIELDS
 
 PROMPT = """\
-Extract fields from page 1 of this Hindi Election Commission booth-roll PDF.
+Extract fields from this Hindi Election Commission booth-roll PDF. You are
+given two images: page 1 (booth/polling-station details) and, when present,
+page 2 (a location page with photos and maps).
 Preserve Hindi text exactly as printed; do not translate, normalize to a more
 common place name, or guess from outside knowledge. Unreadable/absent field ->
 empty string.
@@ -118,6 +147,10 @@ empty string.
 - Do not include labels like "ग्राम", "ब्लॉक", "तहसील" unless part of the value.
 - The voter-count row has start_serial, end_serial, male, female, third_gender,
   total. Read those carefully.
+- map_lat/map_long: on page 2, the "Google Map View" panel has small printed
+  text below the satellite image reading "LAT- <number>" and "LONG-<number>".
+  Copy just the decimal number (keep the decimal point, drop the LAT-/LONG-
+  label). If page 2 is missing or the panel is unreadable, use empty string.
 """
 
 FIELD_DESCRIPTIONS = {
@@ -126,13 +159,16 @@ FIELD_DESCRIPTIONS = {
     "publication_date": "DD-MM-YYYY",
     "sections": "section/tola lines joined with ' ; '",
     "ps_no_name": "polling station number and name as printed",
+    "map_lat": "decimal latitude from page 2's Google Map View panel (LAT- label)",
+    "map_long": "decimal longitude from page 2's Google Map View panel (LONG- label)",
 }
 
 
 def response_schema() -> dict[str, Any]:
     props: dict[str, Any] = {}
     for field in MODEL_FIELDS:
-        if field in {"qualifying_date", "publication_date"} or field in HIN_FIELDS:
+        if (field in {"qualifying_date", "publication_date"}
+                or field in HIN_FIELDS or field in MAP_FIELDS):
             typ = "string"
         else:
             typ = "integer"
@@ -234,13 +270,13 @@ class GeminiApiBackend:
     def headers(self) -> dict[str, str]:
         return {"Content-Type": "application/json", "x-goog-api-key": self._api_key}
 
-    def payload(self, model: str, image_b64: str) -> dict[str, Any]:
+    def payload(self, model: str, images: list[str]) -> dict[str, Any]:
+        input_parts: list[dict[str, Any]] = [{"type": "text", "text": PROMPT}]
+        for image_b64 in images:
+            input_parts.append({"type": "image", "data": image_b64, "mime_type": "image/jpeg"})
         return {
             "model": model,
-            "input": [
-                {"type": "text", "text": PROMPT},
-                {"type": "image", "data": image_b64, "mime_type": "image/jpeg"},
-            ],
+            "input": input_parts,
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -282,12 +318,12 @@ class VertexBackend:
         return {"Content-Type": "application/json",
                 "Authorization": f"Bearer {self._auth.token()}"}
 
-    def payload(self, model: str, image_b64: str) -> dict[str, Any]:
+    def payload(self, model: str, images: list[str]) -> dict[str, Any]:
+        parts: list[dict[str, Any]] = [{"text": PROMPT}]
+        for image_b64 in images:
+            parts.append({"inlineData": {"mimeType": "image/jpeg", "data": image_b64}})
         return {
-            "contents": [{"role": "user", "parts": [
-                {"text": PROMPT},
-                {"inlineData": {"mimeType": "image/jpeg", "data": image_b64}},
-            ]}],
+            "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
                 "responseMimeType": "application/json",
                 "responseSchema": _vertex_schema(response_schema()),
@@ -340,12 +376,89 @@ def make_backend(args: argparse.Namespace) -> GeminiApiBackend | VertexBackend:
     return GeminiApiBackend(api_key)
 
 
-def render_page1_jpeg(pdf_path: Path, dpi: int, quality: int, max_dim: int) -> tuple[str, int]:
-    with pdfplumber.open(pdf_path) as pdf:
+@dataclass
+class PdfItem:
+    """One booth PDF to process, agnostic of whether it lives on local disk
+    or in S3. `read()` fetches the raw PDF bytes on demand (from a worker
+    thread), so nothing is downloaded until it's actually about to be sent
+    to Gemini."""
+
+    name: str
+    part_no: int
+    read: Callable[[], bytes]
+
+
+def part_no_from_name(name: str) -> int:
+    return int(re.sub(r"\D", "", Path(name).stem).lstrip("0") or "0")
+
+
+def local_pdf_items(pdf_dir: Path) -> list[PdfItem]:
+    items = []
+    for p in sorted(pdf_dir.glob("booth_*.pdf")):
+        items.append(PdfItem(p.name, part_no_from_name(p.name), (lambda p=p: p.read_bytes())))
+    return items
+
+
+def s3_list_pdf_items(client: Any, bucket: str, prefix: str) -> list[PdfItem]:
+    items = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            name = obj["Key"].rsplit("/", 1)[-1]
+            if not re.match(r"booth_\d+\.pdf$", name):
+                continue
+            key = obj["Key"]
+            items.append(PdfItem(name, part_no_from_name(name),
+                                 (lambda key=key: s3_get_bytes(client, bucket, key))))
+    items.sort(key=lambda it: it.part_no)
+    return items
+
+
+def s3_get_bytes(client: Any, bucket: str, key: str) -> bytes:
+    return client.get_object(Bucket=bucket, Key=key)["Body"].read()
+
+
+def s3_get_text(client: Any, bucket: str, key: str) -> str | None:
+    """Returns None if the key does not exist yet (first run for this AC)."""
+    try:
+        return s3_get_bytes(client, bucket, key).decode("utf-8-sig")
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in {"NoSuchKey", "404"}:
+            return None
+        raise
+
+
+def s3_put_text(client: Any, bucket: str, key: str, text: str, content_type: str) -> bool:
+    try:
+        client.put_object(Bucket=bucket, Key=key, Body=text.encode("utf-8-sig"),
+                          ContentType=content_type)
+    except (BotoCoreError, ClientError) as exc:
+        log.error("S3 upload failed for s3://%s/%s: %s", bucket, key, exc)
+        return False
+    return True
+
+
+_PDFIUM_LOCK = threading.Lock()
+
+
+def render_pdf_page_jpeg(pdf_bytes: bytes, page_index: int, dpi: int, quality: int,
+                         max_dim: int) -> tuple[str, int]:
+    """Renders one page (0-indexed) to a base64 JPEG. Returns ("", total_pages)
+    if page_index is out of range instead of raising, since page 2 (the
+    location/map page) isn't guaranteed to exist on every booth PDF."""
+    # PDFium (pdfplumber's PDF engine) is not thread-safe: parsing/rendering two
+    # PDFs concurrently from different threads in one process has been observed
+    # to silently hand back another thread's page (caught via the part_no
+    # cross-check in normalize_row/main). Serialize this CPU-bound step; it's a
+    # few tens of ms per booth, so it doesn't bottleneck overall throughput,
+    # which is dominated by the network-bound Gemini call.
+    with _PDFIUM_LOCK, pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         total_pages = len(pdf.pages)
         if not total_pages:
             raise RuntimeError("PDF has no pages")
-        img = pdf.pages[0].to_image(resolution=dpi).original.convert("RGB")
+        if page_index >= total_pages:
+            return "", total_pages
+        img = pdf.pages[page_index].to_image(resolution=dpi).original.convert("RGB")
     try:
         if max_dim and max(img.size) > max_dim:
             scale = max_dim / max(img.size)
@@ -482,38 +595,56 @@ def estimate_cost_from_usage(usage: dict[str, int], input_price_per_m: float,
     return usage["total_tokens"] / 1e6 * max(input_price_per_m, output_price_per_m)
 
 
-def _row_int(row: dict[str, Any], field: str) -> int:
-    value = str(row.get(field) or "").strip()
-    return int(value) if value.isdigit() else 0
-
-
-def log_usage_summary(rows: list[dict[str, Any]], input_price_per_m: float,
-                      output_price_per_m: float) -> None:
-    known = [r for r in rows if any(_row_int(r, f) for f in
-                                    ("input_tokens", "output_tokens", "total_tokens"))]
-    if not known:
-        log.info("Gemini usage metadata was not present in saved rows; cost could not be estimated")
+def log_and_record_usage(
+    ac_no: str,
+    usage_rows: list[dict[str, Any]],
+    booths_failed: int,
+    workers: int,
+    usage_csv_path: Path,
+) -> None:
+    """Logs an AC-wise token-usage summary (goes to stdout + DEFAULT_LOG_FILE
+    via the file handler set up in main()) and appends one aggregate row to
+    usage_csv_path. usage_rows covers only booths actually processed by THIS
+    invocation — booths already done in a prior run don't re-count here.
+    usage_csv_path is local-only and is never uploaded to S3."""
+    if not usage_rows:
+        log.info("AC %s: no new Gemini calls this run; token usage unchanged", ac_no)
         return
-    input_tokens = sum(_row_int(r, "input_tokens") for r in known)
-    output_tokens = sum(_row_int(r, "output_tokens") for r in known)
-    thought_tokens = sum(_row_int(r, "thought_tokens") for r in known)
-    total_tokens = sum(_row_int(r, "total_tokens") for r in known)
-    approx_cost = 0.0
-    for r in known:
-        try:
-            approx_cost += float(r.get("approx_cost_usd") or 0)
-        except ValueError:
-            pass
-    log.info("Gemini usage: %d/%d rows | input %s | output %s | thought %s | total %s tokens",
-             len(known), len(rows), f"{input_tokens:,}", f"{output_tokens:,}",
-             f"{thought_tokens:,}", f"{total_tokens:,}")
-    if input_tokens or output_tokens:
-        log.info("Approx paid-tier cost at $%.2f/M input + $%.2f/M output: $%.4f "
-                 "(avg $%.5f/booth)", input_price_per_m, output_price_per_m,
-                 approx_cost, approx_cost / len(known))
-    else:
-        log.info("Approx paid-tier cost upper bound at $%.2f/M tokens: $%.4f",
-                 max(input_price_per_m, output_price_per_m), approx_cost)
+    n = len(usage_rows)
+    input_tokens = sum(u["input_tokens"] for u in usage_rows)
+    output_tokens = sum(u["output_tokens"] for u in usage_rows)
+    thought_tokens = sum(u["thought_tokens"] for u in usage_rows)
+    cached_tokens = sum(u["cached_tokens"] for u in usage_rows)
+    total_tokens = sum(u["total_tokens"] for u in usage_rows)
+    cost = sum(u["cost"] for u in usage_rows)
+    log.info("AC %s token usage: %d booths (%d failed) | input %s output %s thought %s "
+             "cached %s total %s tokens | approx cost $%.4f (avg $%.5f/booth)",
+             ac_no, n, booths_failed, f"{input_tokens:,}", f"{output_tokens:,}",
+             f"{thought_tokens:,}", f"{cached_tokens:,}", f"{total_tokens:,}",
+             cost, cost / n)
+
+    usage_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not usage_csv_path.exists()
+    with usage_csv_path.open("a", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=AC_USAGE_COLUMNS)
+        if write_header:
+            w.writeheader()
+        w.writerow({
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ac_no": ac_no,
+            "booths_processed": n,
+            "booths_failed": booths_failed,
+            "workers": workers,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "thought_tokens": thought_tokens,
+            "cached_tokens": cached_tokens,
+            "total_tokens": total_tokens,
+            "approx_cost_usd": f"{cost:.6f}",
+            "avg_cost_per_booth": f"{cost / n:.6f}",
+        })
+    log.info("appended AC-wise usage row to %s (local only, not uploaded to S3)",
+             usage_csv_path)
 
 
 GEMINI_PANCHAYAT_PROMPT = """\
@@ -665,10 +796,20 @@ def _clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value)).strip(" :।")
 
 
-def normalize_row(raw: dict[str, Any], pdf_path: Path, ac_no: str, total_pages: int) -> dict[str, Any]:
-    part_no = int(re.sub(r"\D", "", pdf_path.stem).lstrip("0") or "0")
+def _to_coord(value: Any) -> str:
+    """Decimal-degree string, e.g. '19.70169'. Keeps the sign/decimal point
+    but strips any LAT-/LONG- label or degree symbol the model echoed back."""
+    if value is None or value == "":
+        return ""
+    text = str(value).translate(DEV_DIGITS)
+    m = re.search(r"-?\d+\.\d+", text)
+    return m.group(0) if m else ""
+
+
+def normalize_row(raw: dict[str, Any], name: str, part_no: int, ac_no: str,
+                  total_pages: int) -> dict[str, Any]:
     row = {c: "" for c in COLUMNS}
-    row["booth_pdf"] = pdf_path.name
+    row["booth_pdf"] = name
     row["total_pages"] = total_pages
     row["part_no"] = part_no
     row["ac_no"] = int(re.sub(r"\D", "", str(ac_no)) or 0)
@@ -676,7 +817,7 @@ def normalize_row(raw: dict[str, Any], pdf_path: Path, ac_no: str, total_pages: 
     model_part = _to_int(raw.get("part_no", ""))
     if isinstance(model_part, int) and model_part and model_part != part_no:
         log.warning("%s: printed part number %d != filename part number %d",
-                    pdf_path.name, model_part, part_no)
+                    name, model_part, part_no)
 
     for field in NUM_FIELDS:
         if field in {"part_no", "ac_no", "counts_ok"}:
@@ -687,6 +828,8 @@ def normalize_row(raw: dict[str, Any], pdf_path: Path, ac_no: str, total_pages: 
             row[field] = _to_int(raw.get(field, ""))
     for field in HIN_FIELDS:
         row[field] = _clean_text(raw.get(field, ""))
+    for field in MAP_FIELDS:
+        row[field] = _to_coord(raw.get(field, ""))
 
     m, f, th, total = (row["male"], row["female"], row["third_gender"], row["total"])
     if th == "" and isinstance(m, int) and isinstance(f, int) and isinstance(total, int):
@@ -700,11 +843,12 @@ def normalize_row(raw: dict[str, Any], pdf_path: Path, ac_no: str, total_pages: 
 
 
 def process_pdf(
-    pdf_path: Path,
+    item: PdfItem,
     ac_no: str,
     backend: GeminiApiBackend | VertexBackend,
     model: str,
     dpi: int,
+    dpi2: int,
     jpeg_quality: int,
     max_dim: int,
     timeout: int,
@@ -713,30 +857,58 @@ def process_pdf(
     output_price_per_m: float,
     cached_price_per_m: float,
     debug: bool,
-) -> dict[str, Any]:
-    image_b64, total_pages = render_page1_jpeg(pdf_path, dpi, jpeg_quality, max_dim)
+) -> tuple[dict[str, Any], dict[str, int], float]:
+    """Returns (row, usage, cost). `row` never carries token-usage fields —
+    those are aggregated AC-wise by the caller instead (see main())."""
+    pdf_bytes = item.read()
+    image1_b64, total_pages = render_pdf_page_jpeg(pdf_bytes, 0, dpi, jpeg_quality, max_dim)
+    images = [image1_b64]
+    # page 2 (location/map page, with the LAT-/LONG- coordinates) is rendered
+    # at a higher DPI than page 1 since its printed text is much smaller.
+    if total_pages > 1:
+        image2_b64, _ = render_pdf_page_jpeg(pdf_bytes, 1, dpi2, jpeg_quality, max_dim)
+        if image2_b64:
+            images.append(image2_b64)
     response = api_request(backend.url(model), backend.headers(),
-                           backend.payload(model, image_b64),
+                           backend.payload(model, images),
                            timeout=timeout, retries=retries)
     raw = parse_gemini_response(response)
-    row = normalize_row(raw, pdf_path, ac_no, total_pages)
+    row = normalize_row(raw, item.name, item.part_no, ac_no, total_pages)
     usage = extract_usage(response)
     cost = estimate_cost_from_usage(usage, input_price_per_m, output_price_per_m,
                                     cached_price_per_m)
-    row.update(usage)
-    row["approx_cost_usd"] = f"{cost:.6f}"
     if debug:
-        log.info("%s raw=%s", pdf_path.name, json.dumps(raw, ensure_ascii=False))
-        log.info("%s usage=%s cost=$%.6f", pdf_path.name, json.dumps(usage), cost)
-        log.info("%s row=%s", pdf_path.name, json.dumps(row, ensure_ascii=False))
-    return row
+        log.info("%s raw=%s", item.name, json.dumps(raw, ensure_ascii=False))
+        log.info("%s usage=%s cost=$%.6f", item.name, json.dumps(usage), cost)
+        log.info("%s row=%s", item.name, json.dumps(row, ensure_ascii=False))
+    return row, usage, cost
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Extract booth-roll first-page details using Gemini vision")
-    ap.add_argument("--ac", help="AC number; reads booth_list_pdf/<AC>/*.pdf")
-    ap.add_argument("--pdf-dir", type=Path, help="Directory of booth PDFs (overrides --ac)")
-    ap.add_argument("--out", type=Path, help="Output CSV (default booth_list_csv/booth_info_gemini_<AC>.csv)")
+    ap.add_argument("--ac", help="AC number; source PDFs come from S3 unless --pdf-dir is given")
+    ap.add_argument("--pdf-dir", type=Path,
+                    help="Local directory of booth PDFs, e.g. for a quick local test "
+                         "(overrides S3 input; requires --state-cd/--roll-id otherwise)")
+    ap.add_argument("--state-cd", help="State code, e.g. S24 for Uttar Pradesh. Selects the "
+                                       "S3 input prefix and the default S3 output prefix.")
+    ap.add_argument("--roll-id", help="Roll id booth PDFs were downloaded under, e.g. "
+                                      "S24-2026-FIR-1 (same value passed to "
+                                      "download_eci_rolls_fast.py --roll-id)")
+    ap.add_argument("--in-s3-bucket", default=DEFAULT_IN_S3_BUCKET,
+                    help="S3 bucket booth PDFs were uploaded to (default electoral-roll-pdfs)")
+    ap.add_argument("--out", type=Path,
+                    help="Local output CSV, for testing. Default: upload to "
+                         "s3://<out-s3-bucket>/<out-s3-prefix>/<roll-id>/"
+                         "admin_details_<out-s3-prefix>_<roll-year>_AC No.<AC>.csv")
+    ap.add_argument("--out-s3-bucket", default=DEFAULT_OUT_S3_BUCKET,
+                    help="S3 bucket for the extracted booth-info CSV (default electoral-admin-detail)")
+    ap.add_argument("--out-s3-prefix", help="S3 key prefix for the output CSV (default: --state-cd)")
+    ap.add_argument("--usage-log-csv", type=Path, default=DEFAULT_USAGE_CSV,
+                    help="Local-only AC-wise token-usage CSV, appended to, never uploaded to S3 "
+                         f"(default {DEFAULT_USAGE_CSV})")
+    ap.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE,
+                    help=f"Local log file to append to, in addition to stdout (default {DEFAULT_LOG_FILE})")
     ap.add_argument("--env-file", type=Path, help="Optional extra .env path")
     ap.add_argument("--backend", choices=["auto", "gemini", "vertex"], default="auto",
                     help="auto = Vertex if a service-account key is found, else Gemini API key")
@@ -745,6 +917,9 @@ def main() -> None:
     ap.add_argument("--location", default="global", help="Vertex location (default global)")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--dpi", type=int, default=220)
+    ap.add_argument("--dpi2", type=int, default=300,
+                    help="DPI for page 2 (location/map page) — higher than --dpi since "
+                         "the LAT-/LONG- coordinate text printed there is much smaller")
     ap.add_argument("--jpeg-quality", type=int, default=82)
     ap.add_argument("--max-dim", type=int, default=0,
                     help="Downscale page image so its longest side is at most this many px (0 = off)")
@@ -767,46 +942,86 @@ def main() -> None:
     args = ap.parse_args()
 
     if not args.ac and not args.pdf_dir:
-        ap.error("provide --ac or --pdf-dir")
-    backend = make_backend(args)
-    pdf_dir = args.pdf_dir or (HERE / "booth_list_pdf" / str(args.ac))
-    if not pdf_dir.is_dir():
-        raise SystemExit(f"PDF dir not found: {pdf_dir}")
-    ac_no = args.ac or pdf_dir.name
-    out_csv = args.out or HERE / "booth_list_csv" / f"booth_info_gemini_{ac_no}.csv"
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
+        ap.error("provide --ac (reads from S3) or --pdf-dir (local)")
+    if not args.pdf_dir and not (args.state_cd and args.roll_id):
+        ap.error("--state-cd and --roll-id are required when reading PDFs from S3 "
+                 "(or pass --pdf-dir to read local PDFs instead)")
+    if not args.out and not args.roll_id:
+        ap.error("--roll-id is required for the S3 output path (or pass --out for a local file)")
 
-    pdfs = sorted(pdf_dir.glob("booth_*.pdf"))
-    if not pdfs:
-        raise SystemExit(f"No booth_*.pdf files in {pdf_dir}")
+    args.log_file.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(args.log_file)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(file_handler)
+
+    backend = make_backend(args)
+    ac_no = args.ac or args.pdf_dir.name
+
+    s3 = None
+    if not args.pdf_dir or not args.out:
+        # max_pool_connections must cover --workers or boto3's default pool of 10
+        # starts serializing PDF fetches/CSV uploads well before Gemini itself
+        # becomes the bottleneck.
+        s3 = boto3.client("s3", region_name=S3_REGION,
+                          config=Config(max_pool_connections=max(args.workers, 10)))
+
+    if args.pdf_dir:
+        if not args.pdf_dir.is_dir():
+            raise SystemExit(f"PDF dir not found: {args.pdf_dir}")
+        items = local_pdf_items(args.pdf_dir)
+        source_desc = str(args.pdf_dir)
+    else:
+        prefix = f"{args.state_cd}/{args.roll_id.lower()}/{ac_no}/"
+        items = s3_list_pdf_items(s3, args.in_s3_bucket, prefix)
+        source_desc = f"s3://{args.in_s3_bucket}/{prefix}"
+    if not items:
+        raise SystemExit(f"No booth_*.pdf files found in {source_desc}")
+
     if args.parts:
         wanted = {int(x) for x in re.findall(r"\d+", args.parts)}
-        pdfs = [p for p in pdfs if int(re.sub(r"\D", "", p.stem) or 0) in wanted]
-        missing = wanted - {int(re.sub(r"\D", "", p.stem) or 0) for p in pdfs}
+        items = [it for it in items if it.part_no in wanted]
+        missing = wanted - {it.part_no for it in items}
         if missing:
             log.warning("no PDF found for parts: %s", ",".join(map(str, sorted(missing))))
     if args.limit:
-        pdfs = pdfs[: args.limit]
+        items = items[: args.limit]
+
+    if args.out:
+        out_desc = str(args.out)
+    else:
+        out_prefix = args.out_s3_prefix or args.state_cd or str(ac_no)
+        roll_parts = args.roll_id.split("-")
+        roll_year = roll_parts[1] if len(roll_parts) > 1 else args.roll_id
+        filename = f"admin_details_{out_prefix}_{roll_year}_AC No.{ac_no}.csv"
+        out_key = f"{out_prefix}/{args.roll_id.lower()}/{filename}"
+        out_desc = f"s3://{args.out_s3_bucket}/{out_key}"
 
     done, rows = set(), []
-    if out_csv.exists():
-        with out_csv.open(encoding="utf-8-sig") as f:
-            for r in csv.DictReader(f):
-                for field in USAGE_FIELDS:
-                    r.setdefault(field, "")
-                rows.append({c: r.get(c, "") for c in COLUMNS})
-                done.add(r.get("booth_pdf", ""))
-        log.info("resuming; %d booths already in %s", len(done), out_csv.name)
-
-    tmp_csv = out_csv.with_suffix(out_csv.suffix + ".tmp")
+    existing_text = None
+    if args.out:
+        if args.out.exists():
+            existing_text = args.out.read_text(encoding="utf-8-sig")
+    else:
+        existing_text = s3_get_text(s3, args.out_s3_bucket, out_key)
+    if existing_text:
+        for r in csv.DictReader(io.StringIO(existing_text)):
+            rows.append({c: r.get(c, "") for c in COLUMNS})
+            done.add(r.get("booth_pdf", ""))
+        log.info("resuming; %d booths already in %s", len(done), out_desc)
 
     def flush() -> None:
         rows.sort(key=lambda r: int(re.sub(r"\D", "", str(r["booth_pdf"])) or 0))
-        with tmp_csv.open("w", encoding="utf-8-sig", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=COLUMNS)
-            w.writeheader()
-            w.writerows(rows)
-        os.replace(tmp_csv, out_csv)
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=COLUMNS)
+        w.writeheader()
+        w.writerows(rows)
+        if args.out:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            tmp = args.out.with_suffix(args.out.suffix + ".tmp")
+            tmp.write_text(buf.getvalue(), encoding="utf-8-sig", newline="")
+            os.replace(tmp, args.out)
+        else:
+            s3_put_text(s3, args.out_s3_bucket, out_key, buf.getvalue(), "text/csv")
 
     def apply_panchayat_clean() -> None:
         if args.no_panchayat_clean or not rows:
@@ -820,41 +1035,49 @@ def main() -> None:
             r["panchayat_clean"] = pan_map.get(r.get("panchayat", ""), r.get("panchayat", ""))
         flush()
 
-    todo = [p for p in pdfs if p.name not in done]
+    todo = [it for it in items if it.name not in done]
+    usage_rows: list[dict[str, Any]] = []
+    workers = max(1, min(args.workers, len(todo) or 1))
     if not todo:
-        log.info("nothing to do; %s is already complete for selected PDFs", out_csv)
+        log.info("nothing to do; %s is already complete for selected PDFs", out_desc)
         apply_panchayat_clean()
-        log_usage_summary(rows, args.input_price_per_m, args.output_price_per_m)
+        log_and_record_usage(ac_no, usage_rows, 0, workers, args.usage_log_csv)
         return
 
-    def report(n: int, pdf_name: str, row: dict[str, Any]) -> None:
-        log.info("[%d/%d] %s | %s (M%s F%s T%s ok=%s)", n, len(todo), pdf_name,
+    def report(n: int, name: str, row: dict[str, Any]) -> None:
+        log.info("[%d/%d] %s | %s (M%s F%s T%s ok=%s)", n, len(todo), name,
                  row.get("main_town_village", ""), row["male"], row["female"],
                  row["total"], row["counts_ok"])
 
-    def submit(ex: ThreadPoolExecutor, pdf: Path):
-        return ex.submit(process_pdf, pdf, ac_no, backend, args.model, args.dpi,
+    def submit(ex: ThreadPoolExecutor, item: PdfItem):
+        return ex.submit(process_pdf, item, ac_no, backend, args.model, args.dpi, args.dpi2,
                          args.jpeg_quality, args.max_dim, args.timeout, args.retries,
                          args.input_price_per_m, args.output_price_per_m,
                          args.cached_price_per_m, args.debug)
 
     failed: list[str] = []
-    workers = max(1, min(args.workers, len(todo)))
-    log.info("processing %d booths with Gemini model=%s workers=%d", len(todo), args.model, workers)
+    log.info("processing %d booths with Gemini model=%s workers=%d from %s",
+             len(todo), args.model, workers, source_desc)
+
+    def handle_result(name: str, n: int, row: dict[str, Any], usage: dict[str, int],
+                      cost: float) -> None:
+        rows.append(row)
+        usage_rows.append({**usage, "cost": cost})
+        report(n, name, row)
+        flush()
+
     if workers == 1:
-        for i, pdf in enumerate(todo, 1):
+        for i, item in enumerate(todo, 1):
             try:
-                row = process_pdf(pdf, ac_no, backend, args.model, args.dpi,
-                                  args.jpeg_quality, args.max_dim, args.timeout,
-                                  args.retries, args.input_price_per_m,
-                                  args.output_price_per_m, args.cached_price_per_m,
-                                  args.debug)
-                rows.append(row)
-                report(i, pdf.name, row)
-                flush()
+                row, usage, cost = process_pdf(item, ac_no, backend, args.model, args.dpi,
+                                               args.dpi2, args.jpeg_quality, args.max_dim,
+                                               args.timeout, args.retries, args.input_price_per_m,
+                                               args.output_price_per_m, args.cached_price_per_m,
+                                               args.debug)
+                handle_result(item.name, i, row, usage, cost)
             except Exception as exc:  # noqa: BLE001
-                failed.append(pdf.name)
-                log.error("%s failed: %s", pdf.name, exc)
+                failed.append(item.name)
+                log.error("%s failed: %s", item.name, exc)
     else:
         remaining = iter(todo)
         completed = 0
@@ -862,39 +1085,37 @@ def main() -> None:
             futs = {}
             for _ in range(workers):
                 try:
-                    pdf = next(remaining)
+                    item = next(remaining)
                 except StopIteration:
                     break
-                futs[submit(ex, pdf)] = pdf
+                futs[submit(ex, item)] = item
 
             while futs:
                 done_futs, _pending = wait(futs, return_when=FIRST_COMPLETED)
                 for fut in done_futs:
-                    pdf = futs.pop(fut)
+                    item = futs.pop(fut)
                     completed += 1
                     try:
-                        row = fut.result()
-                        rows.append(row)
-                        report(completed, pdf.name, row)
-                        flush()
+                        row, usage, cost = fut.result()
+                        handle_result(item.name, completed, row, usage, cost)
                     except Exception as exc:  # noqa: BLE001
-                        failed.append(pdf.name)
-                        log.error("%s failed: %s", pdf.name, exc)
+                        failed.append(item.name)
+                        log.error("%s failed: %s", item.name, exc)
 
                     try:
-                        next_pdf = next(remaining)
+                        next_item = next(remaining)
                     except StopIteration:
                         continue
-                    futs[submit(ex, next_pdf)] = next_pdf
+                    futs[submit(ex, next_item)] = next_item
 
     apply_panchayat_clean()
 
     bad = sum(1 for r in rows if r.get("counts_ok") != "Y")
-    log.info("Done. %d booths -> %s  (%d rows need a counts check)", len(rows), out_csv, bad)
+    log.info("Done. %d booths -> %s  (%d rows need a counts check)", len(rows), out_desc, bad)
     if failed:
         log.warning("%d booths FAILED (rerun to retry): %s", len(failed),
                     ", ".join(sorted(failed)))
-    log_usage_summary(rows, args.input_price_per_m, args.output_price_per_m)
+    log_and_record_usage(ac_no, usage_rows, len(failed), workers, args.usage_log_csv)
 
 
 if __name__ == "__main__":
