@@ -27,9 +27,9 @@ Usage
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
-from pathlib import Path
 
 import boto3
 
@@ -88,19 +88,50 @@ def cmd_list(_args: argparse.Namespace) -> None:
     r = ec2().describe_instances(Filters=[
         {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
     ])
+    eip_by_instance = {a["InstanceId"]: a["PublicIp"]
+                       for a in ec2().describe_addresses()["Addresses"] if a.get("InstanceId")}
     rows = []
     for res in r["Reservations"]:
         for i in res["Instances"]:
             name = next((t["Value"] for t in i.get("Tags", []) if t["Key"] == "Name"), "(unnamed)")
+            pub = i.get("PublicIpAddress", "")
+            is_eip = i["InstanceId"] in eip_by_instance
+            pub_label = f"{pub} (elastic)" if pub and is_eip else pub or "-"
             rows.append((name, i["InstanceId"], i["InstanceType"],
                         i.get("InstanceLifecycle", "on-demand"), i["State"]["Name"],
-                        i.get("PrivateIpAddress", "")))
+                        i.get("PrivateIpAddress", ""), pub_label))
     if not rows:
         print("no instances running")
         return
     w = max(len(r[0]) for r in rows)
-    for name, iid, itype, lifecycle, state, ip in sorted(rows):
-        print(f"{name:<{w}}  {iid}  {itype:<15}  {lifecycle:<10}  {state:<10}  {ip}")
+    for name, iid, itype, lifecycle, state, priv_ip, pub_label in sorted(rows):
+        print(f"{name:<{w}}  {iid}  {itype:<15}  {lifecycle:<10}  {state:<10}  "
+             f"private={priv_ip:<15}  public={pub_label}")
+
+
+def ensure_eip(instance_id: str, name: str) -> str:
+    """Idempotent: if the instance already has an Elastic IP, return it as-is;
+    otherwise allocate and associate a new one. An EIP survives stop/start/
+    resize (only terminating the instance or explicitly releasing it drops
+    it) - this is what makes a box's address permanent instead of a fresh
+    ephemeral public IP on every restart."""
+    existing = ec2().describe_addresses(Filters=[{"Name": "instance-id", "Values": [instance_id]}])
+    addrs = existing["Addresses"]
+    if addrs:
+        return addrs[0]["PublicIp"]
+    alloc = ec2().allocate_address(
+        Domain="vpc", TagSpecifications=[{"ResourceType": "elastic-ip",
+                                         "Tags": [{"Key": "Name", "Value": f"{name}-eip"}]}])
+    ec2().associate_address(InstanceId=instance_id, AllocationId=alloc["AllocationId"])
+    return alloc["PublicIp"]
+
+
+def cmd_eip(args: argparse.Namespace) -> None:
+    inst = find_by_name(args.name)
+    if not inst:
+        raise SystemExit(f"no instance named {args.name!r}")
+    ip = ensure_eip(inst["InstanceId"], args.name)
+    print(f"{args.name} ({inst['InstanceId']}): static public IP {ip}")
 
 
 def cmd_launch(args: argparse.Namespace) -> None:
@@ -129,11 +160,15 @@ def cmd_launch(args: argparse.Namespace) -> None:
         try:
             r = ec2().run_instances(SubnetId=subnet, **kwargs)
             iid = r["Instances"][0]["InstanceId"]
-            print(f"launched {args.name} ({iid}) in {az}")
+            print(f"launched {args.name} ({iid}) in {az}, security group {SECURITY_GROUP}")
+            if args.eip:
+                ip = ensure_eip(iid, args.name)
+                print(f"static public IP: {ip}")
             if args.wait:
                 ec2().get_waiter("instance_running").wait(InstanceIds=[iid])
-                ip = ec2().describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]["PrivateIpAddress"]
-                print(f"running, private ip {ip}")
+                priv_ip = ec2().describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]["PrivateIpAddress"]
+                print(f"running, private ip {priv_ip} - connect from this box with: "
+                     f"python ec2_manager.py ssh --name {args.name}")
                 if userdata:
                     print("bootstrap running in the background - poll /var/log/bootstrap.log "
                          "for BOOTSTRAP_DONE before using the box")
@@ -216,6 +251,31 @@ def cmd_terminate(args: argparse.Namespace) -> None:
     print(f"terminating {args.name} ({inst['InstanceId']})")
 
 
+def cmd_ssh(args: argparse.Namespace) -> None:
+    """Resolve the instance's current private IP live and exec straight into
+    ssh - no config file to go stale. For connecting *from this box* (same
+    VPC, so private IP; for a laptop outside the VPC use `eip` instead and
+    add a Host entry there, since a private IP is unreachable from outside)."""
+    inst = find_by_name(args.name)
+    if not inst:
+        raise SystemExit(f"no instance named {args.name!r}")
+    ip = inst.get("PrivateIpAddress")
+    if not ip:
+        raise SystemExit(f"{args.name} ({inst['InstanceId']}) has no private IP right now "
+                         f"(state: {inst['State']['Name']}) - start it first")
+    sgs = [g["GroupId"] for g in inst.get("SecurityGroups", [])]
+    if SECURITY_GROUP not in sgs:
+        print(f"warning: {args.name} is not in this project's shared security group "
+             f"{SECURITY_GROUP} (has {sgs}) - if you're connecting from another instance "
+             f"rather than this one, the connection may be refused", file=sys.stderr)
+    key = inst.get("KeyName", DEFAULT_KEY)
+    key_path = os.path.expanduser(f"~/.ssh/{key}.pem")
+    print(f"connecting to {args.name} ({inst['InstanceId']}) at {ip} via security "
+         f"group {sgs}", file=sys.stderr)
+    os.execvp("ssh", ["ssh", "-i", key_path, "-o", "StrictHostKeyChecking=accept-new",
+                      f"ubuntu@{ip}", *args.command])
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -232,6 +292,9 @@ def main() -> None:
     p.add_argument("--disk-gb", type=int, default=60)
     p.add_argument("--no-bootstrap", action="store_true",
                    help="skip installing tesseract/venv/repo via user-data")
+    p.add_argument("--eip", action="store_true",
+                   help="allocate + associate a static Elastic IP (for connecting from "
+                        "outside the VPC, e.g. a laptop - survives stop/start/resize)")
     p.add_argument("--no-wait", dest="wait", action="store_false",
                    help="return as soon as the launch API call succeeds, don't wait for running")
 
@@ -252,9 +315,17 @@ def main() -> None:
     p.add_argument("--name", required=True)
     p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
 
+    p = sub.add_parser("ssh", help="connect from this box via the instance's live private IP")
+    p.add_argument("--name", required=True)
+    p.add_argument("command", nargs="*", help="remote command to run instead of an interactive shell")
+
+    p = sub.add_parser("eip", help="ensure a static Elastic IP is associated (idempotent)")
+    p.add_argument("--name", required=True)
+
     args = ap.parse_args()
     {"list": cmd_list, "launch": cmd_launch, "resize": cmd_resize, "stop": cmd_stop,
-     "start": cmd_start, "terminate": cmd_terminate}[args.cmd](args)
+     "start": cmd_start, "terminate": cmd_terminate, "ssh": cmd_ssh,
+     "eip": cmd_eip}[args.cmd](args)
 
 
 if __name__ == "__main__":
