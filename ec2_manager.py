@@ -156,27 +156,36 @@ def cmd_launch(args: argparse.Namespace) -> None:
                                           "SpotOptions": {"SpotInstanceType": "one-time"}}
 
     last_error = None
+    iid = None
     for az, subnet in SUBNETS.items():
         try:
             r = ec2().run_instances(SubnetId=subnet, **kwargs)
             iid = r["Instances"][0]["InstanceId"]
             print(f"launched {args.name} ({iid}) in {az}, security group {SECURITY_GROUP}")
-            if args.eip:
-                ip = ensure_eip(iid, args.name)
-                print(f"static public IP: {ip}")
-            if args.wait:
-                ec2().get_waiter("instance_running").wait(InstanceIds=[iid])
-                priv_ip = ec2().describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]["PrivateIpAddress"]
-                print(f"running, private ip {priv_ip} - connect from this box with: "
-                     f"python ec2_manager.py ssh --name {args.name}")
-                if userdata:
-                    print("bootstrap running in the background - poll /var/log/bootstrap.log "
-                         "for BOOTSTRAP_DONE before using the box")
-            return
+            break
         except Exception as exc:  # noqa: BLE001 - try the next AZ regardless of why this one failed
             last_error = exc
             print(f"{az} failed: {str(exc)[:150]}", file=sys.stderr)
-    raise SystemExit(f"launch failed in all AZs; last error: {last_error}")
+    if iid is None:
+        raise SystemExit(f"launch failed in all AZs; last error: {last_error}")
+
+    # Everything past this point operates on an instance that already exists -
+    # a failure here must never fall through to trying another AZ, or it
+    # silently launches a duplicate (this bit us once: EIP association
+    # racing a still-"pending" instance looked exactly like "this AZ
+    # failed" to the loop above, before this was split out).
+    if args.eip or args.wait:
+        ec2().get_waiter("instance_running").wait(InstanceIds=[iid])
+    if args.eip:
+        ip = ensure_eip(iid, args.name)
+        print(f"static public IP: {ip}")
+    if args.wait:
+        priv_ip = ec2().describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]["PrivateIpAddress"]
+        print(f"running, private ip {priv_ip} - connect from this box with: "
+             f"python ec2_manager.py ssh --name {args.name}")
+        if userdata:
+            print("bootstrap running in the background - poll /var/log/bootstrap.log "
+                 "for BOOTSTRAP_DONE before using the box")
 
 
 def cmd_resize(args: argparse.Namespace) -> None:
