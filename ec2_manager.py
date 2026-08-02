@@ -250,14 +250,27 @@ def cmd_terminate(args: argparse.Namespace) -> None:
     inst = find_by_name(args.name)
     if not inst:
         raise SystemExit(f"no instance named {args.name!r}")
+    # AWS disassociates an Elastic IP on termination but does not release it -
+    # it just sits there, allocated and quietly billed, until something
+    # releases it. Found this the hard way: two from earlier terminates in
+    # this session were still sitting unassociated before being cleaned up
+    # by hand. Release proactively rather than leave another one behind.
+    addrs = ec2().describe_addresses(Filters=[{"Name": "instance-id",
+                                              "Values": [inst["InstanceId"]]}])["Addresses"]
     if not args.yes:
+        eip_note = f" (also releases its Elastic IP {addrs[0]['PublicIp']})" if addrs else ""
         confirm = input(f"terminate {args.name} ({inst['InstanceId']}, "
-                        f"{inst['InstanceType']})? [y/N] ")
+                        f"{inst['InstanceType']}){eip_note}? [y/N] ")
         if confirm.strip().lower() != "y":
             print("cancelled")
             return
     ec2().terminate_instances(InstanceIds=[inst["InstanceId"]])
     print(f"terminating {args.name} ({inst['InstanceId']})")
+    if addrs:
+        ec2().get_waiter("instance_terminated").wait(InstanceIds=[inst["InstanceId"]])
+        for a in addrs:
+            ec2().release_address(AllocationId=a["AllocationId"])
+            print(f"released Elastic IP {a['PublicIp']}")
 
 
 def cmd_ssh(args: argparse.Namespace) -> None:
