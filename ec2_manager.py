@@ -30,8 +30,21 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 
 import boto3
+
+# boto3 needs AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY in the environment, and
+# this has repeatedly been forgotten (by hand and by me) via `source .env`
+# before running the script - load it here instead of relying on that.
+# Doesn't override anything already set, so a real env var still wins.
+_ENV_FILE = Path("/home/ubuntu/.env")
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _key, _, _value = _line.partition("=")
+            os.environ.setdefault(_key.strip(), _value.strip())
 
 REGION = "ap-south-1"
 SUBNETS = {  # ap-south-1a/1b/1c - tried in this order, since Spot capacity
